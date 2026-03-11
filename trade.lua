@@ -2,11 +2,18 @@ local RunService = game:GetService("RunService")
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
+pcall(function()
+    RunService:Set3dRenderingEnabled(false)
+end)
+
 
 local player = Players.LocalPlayer
 local playerGui = player:WaitForChild("PlayerGui")
 
 local CONFIG = {
+    -- "auto" | "main" | "alt"
+    ROLE = "auto",
+
     -- Tai khoan main: alt se xoay vong gui invite qua list nay theo thu tu.
     MAIN_ACCOUNTS = {
         "GreeneAriesh01",
@@ -46,8 +53,9 @@ local CONFIG = {
     INVITE_WAIT_SECONDS = 7,
     LOOP_DELAY = 0.3,
     ADD_UNIT_MAX_PER_TYPE = 250,
+    STOP_ALT_AFTER_FIRST_TRADE = true,
     AUTO_KICK_ALT_AFTER_TRADE = true,
-    ALT_KICK_DELAY_SECONDS = 1,
+    ALT_KICK_DELAY_SECONDS = 0,
     ALT_KICK_MESSAGE = "Alt trade done - reconnect if needed.",
 }
 
@@ -80,7 +88,44 @@ local ALT_SET = listToSet(CONFIG.ALT_ACCOUNTS)
 local TRADE_UNIT_SET = listToSet(CONFIG.TRADE_UNITS)
 local HAS_ALT_ALLOW_LIST = next(ALT_SET) ~= nil
 local SELF_NAME_NORM = normalizeName(player.Name)
-local IS_MAIN = MAIN_SET[SELF_NAME_NORM] == true
+local SELF_DISPLAY_NORM = normalizeName(player.DisplayName)
+
+local function hasSelfInSet(setTable)
+    return setTable[SELF_NAME_NORM] == true or (SELF_DISPLAY_NORM ~= "" and setTable[SELF_DISPLAY_NORM] == true)
+end
+
+local function resolveRole()
+    local forcedRole = normalizeName(CONFIG.ROLE or "auto")
+    if forcedRole == "main" then
+        return "main"
+    end
+    if forcedRole == "alt" then
+        return "alt"
+    end
+
+    if hasSelfInSet(MAIN_SET) then
+        return "main"
+    end
+
+    if HAS_ALT_ALLOW_LIST then
+        if hasSelfInSet(ALT_SET) then
+            return "alt"
+        end
+        return "main"
+    end
+
+    return "alt"
+end
+
+local ROLE = resolveRole()
+local IS_MAIN = ROLE == "main"
+
+local OTHER_MAIN_SET = {}
+for mainName in pairs(MAIN_SET) do
+    if mainName ~= SELF_NAME_NORM and mainName ~= SELF_DISPLAY_NORM then
+        OTHER_MAIN_SET[mainName] = true
+    end
+end
 
 local function log(message)
     print(string.format("[AutoTrade][%s] %s", player.Name, message))
@@ -90,6 +135,12 @@ local function kickSelf(reason)
     pcall(function()
         player:Kick(reason or "Auto kick")
     end)
+end
+
+local function haltAltExecution()
+    while true do
+        task.wait(60)
+    end
 end
 
 local function clickButton(button)
@@ -316,9 +367,10 @@ local function addAllConfiguredUnitsToTrade()
     local tradeInventory = getTradeInventoryScroll()
     if not tradeInventory then
         log("Khong tim thay kho trade inventory.")
-        return
+        return 0
     end
 
+    local totalAdded = 0
     for _, unitName in ipairs(CONFIG.TRADE_UNITS) do
         local addedCount = 0
         for _ = 1, CONFIG.ADD_UNIT_MAX_PER_TYPE do
@@ -346,35 +398,41 @@ local function addAllConfiguredUnitsToTrade()
 
         if addedCount > 0 then
             log(string.format("Da them %s x%d vao trade.", unitName, addedCount))
+            totalAdded += addedCount
         end
     end
+
+    return totalAdded
 end
 
-local function finalizeTradeAsAlt()
-    local accepted = false
+local function finalizeTradeAsAlt(hasAddedAnyUnit)
+    local sawTradeScreen = false
+    local clickedFinalAccept = false
     local start = tick()
-    while tick() - start <= 30 do
+
+    while tick() - start <= 35 do
         local tradeFrame = getTradeFrame()
         if not tradeFrame then
-            return accepted
+            if sawTradeScreen and (clickedFinalAccept or hasAddedAnyUnit) then
+                return true
+            end
+            return false
         end
 
+        sawTradeScreen = true
         clickTermsAcceptIfAny()
 
         local finalAccept = getFinalAcceptButton()
         if finalAccept then
             clickButton(finalAccept)
-            accepted = true
-            task.wait(0.5)
+            clickedFinalAccept = true
+            task.wait(0.25)
         else
             task.wait(0.2)
         end
-
-        if accepted and waitUntilTradeCloses(2) then
-            return true
-        end
     end
-    return accepted
+
+    return false
 end
 
 local function getOnlineMainPlayers()
@@ -382,6 +440,10 @@ local function getOnlineMainPlayers()
     local playersByNormName = {}
     for _, plr in ipairs(Players:GetPlayers()) do
         playersByNormName[normalizeName(plr.Name)] = plr
+        local displayNorm = normalizeName(plr.DisplayName)
+        if displayNorm ~= "" and not playersByNormName[displayNorm] then
+            playersByNormName[displayNorm] = plr
+        end
     end
 
     for _, mainName in ipairs(CONFIG.MAIN_ACCOUNTS) do
@@ -451,7 +513,7 @@ end
 local function runMainLoop()
     log("Role MAIN: chi chap nhan loi moi trade tu alt hop le.")
     if not HAS_ALT_ALLOW_LIST then
-        log("ALT_ACCOUNTS dang rong -> main se chap nhan moi loi moi trade.")
+        log("ALT_ACCOUNTS dang rong -> main chap nhan invite khong thuoc danh sach main.")
     end
 
     while true do
@@ -467,7 +529,10 @@ local function runMainLoop()
             if HAS_ALT_ALLOW_LIST then
                 inviter = waitForNameMentionInTexts(tradeFrame, ALT_SET, 1.2)
             else
-                inviter = "any_alt"
+                local inviterMain = waitForNameMentionInTexts(tradeFrame, OTHER_MAIN_SET, 0.8)
+                if not inviterMain then
+                    inviter = "any_alt"
+                end
             end
 
             if inviter then
@@ -499,11 +564,10 @@ local function runAltLoop()
     while true do
         tryInviteUntilTradeOpen()
         clickTermsAcceptIfAny()
-        addAllConfiguredUnitsToTrade()
-        local accepted = finalizeTradeAsAlt()
-        if accepted then
-            log("Da bam accept trade. Cho trade ket thuc...")
-            waitUntilTradeCloses(15)
+        local totalAdded = addAllConfiguredUnitsToTrade()
+        local completed = finalizeTradeAsAlt(totalAdded > 0)
+        if completed then
+            log("Trade da ket thuc.")
             if CONFIG.AUTO_KICK_ALT_AFTER_TRADE then
                 local delaySeconds = tonumber(CONFIG.ALT_KICK_DELAY_SECONDS) or 0
                 if delaySeconds > 0 then
@@ -511,6 +575,12 @@ local function runAltLoop()
                 end
                 log("Trade xong, tien hanh kick alt.")
                 kickSelf(CONFIG.ALT_KICK_MESSAGE)
+                task.wait(0.4)
+            end
+
+            if CONFIG.STOP_ALT_AFTER_FIRST_TRADE then
+                log("Dung script alt sau trade dau tien.")
+                haltAltExecution()
                 return
             end
         else
@@ -520,6 +590,7 @@ local function runAltLoop()
     end
 end
 
+log("Role detect: " .. ROLE)
 if IS_MAIN then
     runMainLoop()
 else
